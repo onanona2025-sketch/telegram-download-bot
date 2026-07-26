@@ -184,6 +184,17 @@ def build_ydl_opts(extra=None, is_audio=False):
         "extractor_retries": 3,
         "ignoreerrors": False,
         "noprogress": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web_creator", "mweb"],
+                "player_skip": ["configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.youtube.com/",
+        },
     }
     ffmpeg_dir = _find_ffmpeg()
     if ffmpeg_dir:
@@ -489,22 +500,30 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bestaudio[ext=m4a]/bestaudio/best",
             "best",
         ]
+        player_clients = ["android", "ios", "web_creator", "mweb"]
         for attempt_fmt in format_attempts:
-            attempt_opts = dict(ydl_opts)
-            attempt_opts["format"] = attempt_fmt
-            try:
-                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    fn = ydl.prepare_filename(info)
-                    if is_audio and HAS_FFMPEG:
-                        fn = str(Path(fn).with_suffix(".mp3"))
-                    elif merge_fmt and HAS_FFMPEG:
-                        fn = str(Path(fn).with_suffix(f".{merge_fmt}"))
-                    return info, fn
-            except Exception as e:
-                last_exc = e
-                logger.warning("Format '%s' failed: %s", attempt_fmt, e)
-                continue
+            for pc in player_clients:
+                attempt_opts = dict(ydl_opts)
+                attempt_opts["format"] = attempt_fmt
+                attempt_opts["extractor_args"] = {
+                    "youtube": {
+                        "player_client": [pc],
+                        "player_skip": ["configs"],
+                    }
+                }
+                try:
+                    with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        fn = ydl.prepare_filename(info)
+                        if is_audio and HAS_FFMPEG:
+                            fn = str(Path(fn).with_suffix(".mp3"))
+                        elif merge_fmt and HAS_FFMPEG:
+                            fn = str(Path(fn).with_suffix(f".{merge_fmt}"))
+                        return info, fn
+                except Exception as e:
+                    last_exc = e
+                    logger.warning("Format '%s' player '%s' failed: %s", attempt_fmt, pc, e)
+                    continue
         raise last_exc or yt_dlp.utils.DownloadError("All format attempts failed")
 
     loop = asyncio.get_running_loop()
