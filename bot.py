@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import json
 import logging
 import asyncio
@@ -11,12 +12,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import date
 from pathlib import Path
 from urllib.request import urlopen
+
+def _install_deps():
+    required = ["yt-dlp>=2024.0.0", "python-telegram-bot>=20.0"]
+    for pkg in required:
+        name = pkg.split(">=")[0].split("<=")[0].split("==")[0].split("!=")[0]
+        try:
+            __import__(name.replace("-", "_"))
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+
+_install_deps()
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
 class HealthHandler(BaseHTTPRequestHandler):
