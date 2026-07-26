@@ -186,7 +186,7 @@ def build_ydl_opts(extra=None, is_audio=False):
         "noprogress": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web_creator", "mweb"],
+                "player_client": ["tv_embedded", "android_vr", "mediaconnect"],
                 "player_skip": ["configs"],
             }
         },
@@ -500,7 +500,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bestaudio[ext=m4a]/bestaudio/best",
             "best",
         ]
-        player_clients = ["android", "ios", "web_creator", "mweb"]
+        player_clients = ["tv_embedded", "android_vr", "mediaconnect", "android", "ios"]
         for attempt_fmt in format_attempts:
             for pc in player_clients:
                 attempt_opts = dict(ydl_opts)
