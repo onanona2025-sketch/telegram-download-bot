@@ -28,7 +28,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "2000")) * 1024 * 1024
 DAILY_LIMIT_FREE = int(os.getenv("DAILY_LIMIT_FREE", "10"))
 DB_PATH = "bot_database.json"
 DB_LOCK = threading.Lock()
@@ -118,9 +118,10 @@ def extract_domain(url):
 def _find_ffmpeg():
     path = os.getenv("FFMPEG_PATH") or ""
     if path and shutil.which(path):
-        return path
-    if shutil.which("ffmpeg"):
-        return "ffmpeg"
+        return str(Path(path).parent) if Path(path).is_file() else path
+    found = shutil.which("ffmpeg")
+    if found:
+        return str(Path(found).parent)
     return None
 
 
@@ -130,12 +131,16 @@ def build_ydl_opts(extra=None, is_audio=False):
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 30,
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 5,
+        "fragment_retries": 5,
         "nocheckcertificate": True,
         "extractor_retries": 3,
-        "ffmpeg_location": _find_ffmpeg(),
+        "ignoreerrors": False,
+        "noprogress": True,
     }
+    ffmpeg_dir = _find_ffmpeg()
+    if ffmpeg_dir:
+        opts["ffmpeg_location"] = ffmpeg_dir
     if is_audio:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -150,14 +155,20 @@ def build_ydl_opts(extra=None, is_audio=False):
 
 
 async def edit_callback_message(query, text, reply_markup=None):
-    if query.message.text is not None:
-        return await query.edit_message_text(text, reply_markup=reply_markup)
-    else:
+    try:
+        if query.message.text is not None:
+            return await query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return await query.message.reply_text(text, reply_markup=reply_markup)
+    except Exception:
         try:
-            await query.message.delete()
+            return await query.message.reply_text(text, reply_markup=reply_markup)
         except Exception:
-            pass
-        return await query.message.reply_text(text, reply_markup=reply_markup)
+            return None
 
 
 class DownloadTracker:
@@ -255,10 +266,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with yt_dlp.YoutubeDL(build_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as e:
         logger.exception("Info extraction failed")
+        error_text = str(e)[:200]
         await status_msg.edit_text(
-            "Could not check the link.\n"
+            f"Could not check the link.\n"
+            f"Error: {error_text}\n\n"
             "The link may be invalid, deleted, or from an unsupported site."
         )
         return
@@ -269,39 +282,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thumbnail_url = info.get("thumbnail")
     domain = extract_domain(url)
 
-    available_q = {"audio": True}
-    has_video = False
-    for f in info.get("formats", []):
+    formats = info.get("formats", [])
+    height_map = {}
+    for f in formats:
         h = f.get("height")
         vcodec = f.get("vcodec", "none")
-        if h and vcodec != "none":
-            has_video = True
-            if h <= 480:
-                available_q["480"] = True
-            elif h <= 720:
-                available_q["720"] = True
-            elif h <= 1080:
-                available_q["1080"] = True
-            elif h > 1080:
-                available_q["2160"] = True
+        acodec = f.get("acodec", "none")
+        if vcodec != "none" and h:
+            height_map[h] = True
+
+    available_q = set()
+    for h in height_map:
+        if h <= 360:
+            available_q.add("360")
+        if h <= 480:
+            available_q.add("480")
+        if h <= 720:
+            available_q.add("720")
+        if h <= 1080:
+            available_q.add("1080")
+        if h > 1080:
+            available_q.add("2160")
 
     keyboard = []
     row = []
     if "1080" in available_q:
-        row.append(InlineKeyboardButton("1080p", callback_data="mp4_1080"))
+        row.append(InlineKeyboardButton("1080p", callback_data="dl_1080"))
     if "720" in available_q:
-        row.append(InlineKeyboardButton("720p", callback_data="mp4_720"))
+        row.append(InlineKeyboardButton("720p", callback_data="dl_720"))
     if row:
         keyboard.append(row)
     row2 = []
     if "480" in available_q:
-        row2.append(InlineKeyboardButton("480p", callback_data="mp4_480"))
-    if "audio" in available_q:
-        row2.append(InlineKeyboardButton("MP3", callback_data="mp3"))
-    if row2:
-        keyboard.append(row2)
-    if not keyboard:
-        keyboard.append([InlineKeyboardButton("Download", callback_data="mp4_best")])
+        row2.append(InlineKeyboardButton("480p", callback_data="dl_480"))
+    if "360" in available_q:
+        row2.append(InlineKeyboardButton("360p", callback_data="dl_360"))
+    row2.append(InlineKeyboardButton("MP3", callback_data="dl_mp3"))
+    keyboard.append(row2)
     keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
 
     context.user_data["current_url"] = url
@@ -359,6 +376,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_callback_message(query, "Download cancelled.")
         return
 
+    if not choice.startswith("dl_"):
+        return
+
     if user.id != ADMIN_ID:
         remaining = get_remaining(user.id)
         if remaining <= 0:
@@ -370,20 +390,19 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_callback_message(query, "Link expired. Please send a new link.")
         return
 
-    quality_labels = {
-        "mp4_1080": ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "mp4"),
-        "mp4_720": ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]/best", "mp4"),
-        "mp4_480": ("480p", "bestvideo[height<=480]+bestaudio/best[height<=480]/best", "mp4"),
-        "mp4_best": ("Best", "best", "mp4"),
-        "mp3": ("MP3", "bestaudio/best", None),
+    quality_map = {
+        "dl_1080": ("1080p", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "mp4"),
+        "dl_720":  ("720p",  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best", "mp4"),
+        "dl_480":  ("480p",  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best", "mp4"),
+        "dl_360":  ("360p",  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best", "mp4"),
+        "dl_mp3":  ("MP3",   "bestaudio/best", None),
     }
 
-    if choice not in quality_labels:
-        await edit_callback_message(query, "Invalid choice.")
+    if choice not in quality_map:
         return
 
-    label, fmt, merge_fmt = quality_labels[choice]
-    is_audio = choice == "mp3"
+    label, fmt, merge_fmt = quality_map[choice]
+    is_audio = choice == "dl_mp3"
 
     ydl_opts = build_ydl_opts(
         {"format": fmt},
@@ -405,14 +424,32 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            fn = ydl.prepare_filename(info)
-            if is_audio:
-                fn = str(Path(fn).with_suffix(".mp3"))
-            elif merge_fmt:
-                fn = str(Path(fn).with_suffix(f".{merge_fmt}"))
-            return info, fn
+        last_exc = None
+        format_attempts = [
+            fmt,
+            "bestvideo+bestaudio/best",
+            "best",
+        ] if not is_audio else [
+            "bestaudio/best",
+            "best",
+        ]
+        for attempt_fmt in format_attempts:
+            attempt_opts = dict(ydl_opts)
+            attempt_opts["format"] = attempt_fmt
+            try:
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    fn = ydl.prepare_filename(info)
+                    if is_audio:
+                        fn = str(Path(fn).with_suffix(".mp3"))
+                    elif merge_fmt:
+                        fn = str(Path(fn).with_suffix(f".{merge_fmt}"))
+                    return info, fn
+            except Exception as e:
+                last_exc = e
+                logger.warning("Format '%s' failed: %s", attempt_fmt, e)
+                continue
+        raise last_exc or yt_dlp.utils.DownloadError("All format attempts failed")
 
     loop = asyncio.get_running_loop()
     future = loop.run_in_executor(None, download)
@@ -421,25 +458,27 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         while not future.done():
             if tracker.cancelled:
-                await edit_callback_message(status_msg if hasattr(status_msg, 'edit_text') else query.message, "Download cancelled.")
+                await edit_callback_message(
+                    status_msg if status_msg and hasattr(status_msg, 'edit_text') else query.message,
+                    "Download cancelled."
+                )
                 return
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
             pct, speed, eta = tracker.get_progress()
             bar = progress_bar(pct)
-            parts = [f"Downloading: {label}", f"`{bar}`"]
+            parts = [f"Downloading: {label}", f"{bar}"]
             if speed:
                 parts.append(f"Speed: {speed}")
             if eta:
                 parts.append(f"ETA: {eta}")
             try:
-                if hasattr(status_msg, 'edit_text'):
+                if status_msg and hasattr(status_msg, 'edit_text'):
                     await status_msg.edit_text(
                         "\n".join(parts),
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("Cancel", callback_data="cancel")
                         ]]),
-                        parse_mode="Markdown",
                     )
             except Exception:
                 pass
@@ -475,9 +514,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        title = info.get("title", "")
         caption = (
             f"Downloaded!\n"
-            f"{info.get('title', '')}\n"
+            f"{title}\n"
             f"{label} | {fmt_size(file_size)}"
         )
 
@@ -504,13 +544,15 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text("Download cancelled.")
         except Exception:
             pass
-    except Exception:
+    except Exception as e:
         logger.exception("Download failed")
+        error_detail = str(e)[:300]
         try:
             if status_msg and hasattr(status_msg, 'edit_text'):
                 await status_msg.edit_text(
-                    "Download failed.\n"
-                    "The link may be private, deleted, or the video is too long."
+                    f"Download failed.\n\n"
+                    f"Error: {error_detail}\n\n"
+                    "Try a different quality or check if the link is public."
                 )
         except Exception:
             pass
