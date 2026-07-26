@@ -158,6 +158,10 @@ def _find_ffmpeg():
     return None
 
 
+HAS_FFMPEG = _find_ffmpeg() is not None
+logger.info("ffmpeg available: %s", HAS_FFMPEG)
+
+
 def build_ydl_opts(extra=None, is_audio=False):
     opts = {
         "outtmpl": f"{DOWNLOAD_DIR}/%(title).80s.%(ext)s",
@@ -174,7 +178,7 @@ def build_ydl_opts(extra=None, is_audio=False):
     ffmpeg_dir = _find_ffmpeg()
     if ffmpeg_dir:
         opts["ffmpeg_location"] = ffmpeg_dir
-    if is_audio:
+    if is_audio and HAS_FFMPEG:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -431,6 +435,15 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "dl_mp3":  ("MP3",   "bestaudio/best", None),
     }
 
+    if not HAS_FFMPEG:
+        quality_map = {
+            "dl_1080": ("1080p", "best[height<=1080][ext=mp4]/best[height<=1080]/best", "mp4"),
+            "dl_720":  ("720p",  "best[height<=720][ext=mp4]/best[height<=720]/best", "mp4"),
+            "dl_480":  ("480p",  "best[height<=480][ext=mp4]/best[height<=480]/best", "mp4"),
+            "dl_360":  ("360p",  "best[height<=360][ext=mp4]/best[height<=360]/best", "mp4"),
+            "dl_mp3":  ("MP3",   "bestaudio[ext=m4a]/best[ext=m4a]/bestaudio/best", None),
+        }
+
     if choice not in quality_map:
         return
 
@@ -460,10 +473,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_exc = None
         format_attempts = [
             fmt,
-            "bestvideo+bestaudio/best",
+            "best[ext=mp4]/best",
             "best",
         ] if not is_audio else [
-            "bestaudio/best",
+            "bestaudio[ext=m4a]/bestaudio/best",
             "best",
         ]
         for attempt_fmt in format_attempts:
@@ -473,9 +486,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     fn = ydl.prepare_filename(info)
-                    if is_audio:
+                    if is_audio and HAS_FFMPEG:
                         fn = str(Path(fn).with_suffix(".mp3"))
-                    elif merge_fmt:
+                    elif merge_fmt and HAS_FFMPEG:
                         fn = str(Path(fn).with_suffix(f".{merge_fmt}"))
                     return info, fn
             except Exception as e:
