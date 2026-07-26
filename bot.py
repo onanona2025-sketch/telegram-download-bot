@@ -36,6 +36,20 @@ def start_health_server():
     server.serve_forever()
 
 
+def self_ping():
+    port = os.getenv("PORT", "")
+    if not port:
+        return
+    import time
+    import urllib.request
+    while True:
+        time.sleep(600)
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10)
+        except Exception:
+            pass
+
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -594,6 +608,8 @@ def main():
     if os.getenv("PORT"):
         t = threading.Thread(target=start_health_server, daemon=True)
         t.start()
+        t2 = threading.Thread(target=self_ping, daemon=True)
+        t2.start()
         logger.info("Health check server started")
 
     app = Application.builder().token(TOKEN).build()
