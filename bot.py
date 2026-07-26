@@ -7,6 +7,7 @@ import re
 import tempfile
 import threading
 import shutil
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import date
 from pathlib import Path
 from urllib.request import urlopen
@@ -16,6 +17,24 @@ import yt_dlp
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -571,6 +590,11 @@ def main():
         sys.exit(1)
 
     logger.info("Bot starting... Token: %s... Admin: %s", TOKEN[:10], ADMIN_ID)
+
+    if os.getenv("PORT"):
+        t = threading.Thread(target=start_health_server, daemon=True)
+        t.start()
+        logger.info("Health check server started")
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))

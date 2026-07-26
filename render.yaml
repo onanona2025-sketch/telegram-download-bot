@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: telegram-download-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DAILY_LIMIT_FREE
+        value: "10"
+      - key: MAX_FILE_SIZE_MB
+        value: "2000"
