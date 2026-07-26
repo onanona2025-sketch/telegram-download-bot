@@ -1,4 +1,12 @@
-import os, sys, json, logging, asyncio, time, re, tempfile, threading
+import os
+import sys
+import json
+import logging
+import asyncio
+import re
+import tempfile
+import threading
+import shutil
 from datetime import date
 from pathlib import Path
 from urllib.request import urlopen
@@ -21,15 +29,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
-DAILY_LIMIT_FREE = int(os.getenv("DAILY_LIMIT_FREE", "2"))
+DAILY_LIMIT_FREE = int(os.getenv("DAILY_LIMIT_FREE", "10"))
 DB_PATH = "bot_database.json"
 DB_LOCK = threading.Lock()
+BOT_NAME = "Omar"
 
 Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
 
 def load_db():
     with DB_LOCK:
@@ -39,10 +45,12 @@ def load_db():
         except (FileNotFoundError, json.JSONDecodeError):
             return {"users": {}, "total_downloads": 0}
 
+
 def save_db(data):
     with DB_LOCK:
         with open(DB_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def _get_user_entry(db, uid):
     today = str(date.today())
@@ -51,10 +59,12 @@ def _get_user_entry(db, uid):
         u = {"d": 0, "dt": today}
     return u
 
+
 def get_remaining(user_id):
     db = load_db()
     u = _get_user_entry(db, str(user_id))
     return DAILY_LIMIT_FREE - u["d"]
+
 
 def inc_downloads(user_id):
     db = load_db()
@@ -66,6 +76,7 @@ def inc_downloads(user_id):
     db["total_downloads"] = db.get("total_downloads", 0) + 1
     save_db(db)
 
+
 def get_stats():
     db = load_db()
     total = db.get("total_downloads", 0)
@@ -75,18 +86,16 @@ def get_stats():
     )
     return total, active_today, len(db["users"])
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def fmt_duration(secs):
     if not secs:
-        return "مباشر"
+        return "Live"
     m, s = divmod(int(secs), 60)
     h, m = divmod(m, 60)
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
 
 def fmt_size(b):
     for unit in ("B", "KB", "MB", "GB"):
@@ -95,22 +104,37 @@ def fmt_size(b):
         b /= 1024
     return f"{b:.1f} TB"
 
+
 def progress_bar(pct):
     filled = int(pct / 10)
     return f"{'█' * filled}{'░' * (10 - filled)} {pct:.1f}%"
+
 
 def extract_domain(url):
     m = re.search(r"https?://(?:www\.)?([^/]+)", url)
     return m.group(1) if m else url
 
+
+def _find_ffmpeg():
+    path = os.getenv("FFMPEG_PATH") or ""
+    if path and shutil.which(path):
+        return path
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    return None
+
+
 def build_ydl_opts(extra=None, is_audio=False):
     opts = {
-        "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+        "outtmpl": f"{DOWNLOAD_DIR}/%(title).80s.%(ext)s",
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 10,
-        "ffmpeg_location": os.getenv("FFMPEG_PATH") or None,
+        "fragment_retries": 10,
+        "nocheckcertificate": True,
+        "extractor_retries": 3,
+        "ffmpeg_location": _find_ffmpeg(),
     }
     if is_audio:
         opts["postprocessors"] = [{
@@ -124,12 +148,8 @@ def build_ydl_opts(extra=None, is_audio=False):
         opts.update(extra)
     return opts
 
-# ---------------------------------------------------------------------------
-# Helper to edit callback message (handles both text and photo messages)
-# ---------------------------------------------------------------------------
 
 async def edit_callback_message(query, text, reply_markup=None):
-    """Edit the callback query message. If it's a photo (no text), delete and send new."""
     if query.message.text is not None:
         return await query.edit_message_text(text, reply_markup=reply_markup)
     else:
@@ -139,9 +159,6 @@ async def edit_callback_message(query, text, reply_markup=None):
             pass
         return await query.message.reply_text(text, reply_markup=reply_markup)
 
-# ---------------------------------------------------------------------------
-# Download tracker (thread-safe)
-# ---------------------------------------------------------------------------
 
 class DownloadTracker:
     def __init__(self):
@@ -154,7 +171,7 @@ class DownloadTracker:
 
     def hook(self, d):
         if self.cancelled:
-            raise yt_dlp.utils.DownloadError("تم إلغاء التحميل من قبل المستخدم")
+            raise yt_dlp.utils.DownloadError("Download cancelled by user")
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             downloaded = d.get("downloaded_bytes", 0)
@@ -171,9 +188,6 @@ class DownloadTracker:
         with self._lock:
             return self.pct, self.speed, self.eta
 
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -181,32 +195,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user.id == ADMIN_ID:
         text = (
-            f"⚡ أهلاً بك يا مالك البوت!\n\n"
-            f"📊 إحصائيات البوت:\n"
-            f"• إجمالي التحميلات: {total}\n"
-            f"• المستخدمون النشطون اليوم: {active}\n"
-            f"• إجمالي المستخدمين: {users}\n\n"
-            f"📥 أرسل رابط فيديو لبدء التحميل.\n"
-            f"👑 أنت المالك — بدون حدود يومية."
+            f"Hey Omar! Welcome back.\n\n"
+            f"Bot Stats:\n"
+            f"  Total Downloads: {total}\n"
+            f"  Active Users Today: {active}\n"
+            f"  Total Users: {users}\n\n"
+            f"Send a video link to start downloading.\n"
+            f"You are the owner - no daily limits."
         )
     else:
         remaining = get_remaining(user.id)
         text = (
-            f"🎥 مرحباً بك في بوت التحميل!\n\n"
-            f"📥 أرسل رابط فيديو وسأقوم بتحميله لك.\n"
-            f"يدعم: YouTube, TikTok, Instagram, Twitter, Facebook والمزيد...\n\n"
-            f"⚡ تبقى لك اليوم: {remaining} تحميلات\n"
-            f"💎 للاشتراك غير المحدود تواصل مع المطور."
+            f"Hey! Welcome to {BOT_NAME}'s Download Bot!\n\n"
+            f"Send a video link and I will download it for you.\n"
+            f"Supported: YouTube, TikTok, Instagram, Twitter, Facebook and more.\n\n"
+            f"Downloads left today: {remaining}\n"
+            f"Contact the owner for unlimited access."
         )
     await update.message.reply_text(text)
 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚙️ الأوامر المتاحة:\n\n"
-        "/start - عرض الترحيب\n"
-        "/help - هذه التعليمات\n\n"
-        "📥 فقط أرسل رابط الفيديو لبدء التحميل."
+        "Available Commands:\n\n"
+        "/start - Show welcome message\n"
+        "/help - This help text\n\n"
+        "Just send a video link to start downloading."
     )
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -214,54 +230,52 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracker = context.user_data.get("tracker")
     if tracker:
         tracker.cancelled = True
-    await edit_callback_message(query, "❌ تم إلغاء التحميل.")
+    await edit_callback_message(query, "Download cancelled.")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     url = update.message.text.strip()
 
     if not url.startswith("http"):
-        await update.message.reply_text("⚠️ أرسل رابطاً صحيحاً يبدأ بـ http")
+        await update.message.reply_text("Please send a valid link starting with http")
         return
 
     if user.id != ADMIN_ID:
         remaining = get_remaining(user.id)
         if remaining <= 0:
-            keyboard = [[InlineKeyboardButton("💎 تواصل مع المالك", url="https://t.me/botfather")]]
             await update.message.reply_text(
-                "❌ استنفذت حدود التحميل اليومية.\n"
-                "اشترك للتحميل غير المحدود.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                "You have reached your daily download limit.\n"
+                "Contact the owner for unlimited access."
             )
             return
 
-    status_msg = await update.message.reply_text("🔍 جاري فحص الرابط...")
+    status_msg = await update.message.reply_text("Checking link...")
 
     try:
         with yt_dlp.YoutubeDL(build_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception as e:
+    except Exception:
         logger.exception("Info extraction failed")
         await status_msg.edit_text(
-            "❌ تعذر فحص الرابط. الأسباب المحتملة:\n"
-            "• الرابط غير صالح أو محذوف\n"
-            "• الموقع غير مدعوم أو يحتاج تسجيل دخول\n"
-            "• الفيديو خاص (private) أو مقيد بحظر عمري"
+            "Could not check the link.\n"
+            "The link may be invalid, deleted, or from an unsupported site."
         )
         return
 
-    title = info.get("title", "بدون عنوان")
+    title = info.get("title", "No title")
     duration = fmt_duration(info.get("duration"))
-    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "غير معروف"
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown"
     thumbnail_url = info.get("thumbnail")
-    duration_secs = info.get("duration", 0)
     domain = extract_domain(url)
 
-    # Detect available qualities
     available_q = {"audio": True}
+    has_video = False
     for f in info.get("formats", []):
         h = f.get("height")
-        if h:
+        vcodec = f.get("vcodec", "none")
+        if h and vcodec != "none":
+            has_video = True
             if h <= 480:
                 available_q["480"] = True
             elif h <= 720:
@@ -274,31 +288,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     row = []
     if "1080" in available_q:
-        row.append(InlineKeyboardButton("🎬 1080p", callback_data="mp4_1080"))
+        row.append(InlineKeyboardButton("1080p", callback_data="mp4_1080"))
     if "720" in available_q:
-        row.append(InlineKeyboardButton("🎬 720p", callback_data="mp4_720"))
+        row.append(InlineKeyboardButton("720p", callback_data="mp4_720"))
     if row:
         keyboard.append(row)
     row2 = []
     if "480" in available_q:
-        row2.append(InlineKeyboardButton("📱 480p", callback_data="mp4_480"))
+        row2.append(InlineKeyboardButton("480p", callback_data="mp4_480"))
     if "audio" in available_q:
-        row2.append(InlineKeyboardButton("🎵 MP3", callback_data="mp3"))
+        row2.append(InlineKeyboardButton("MP3", callback_data="mp3"))
     if row2:
         keyboard.append(row2)
-    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+    if not keyboard:
+        keyboard.append([InlineKeyboardButton("Download", callback_data="mp4_best")])
+    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
 
     context.user_data["current_url"] = url
     context.user_data["current_info"] = info
 
     caption = (
-        f"🎬 {title}\n\n"
-        f"👤 {uploader}\n"
-        f"⏱ {duration}\n"
-        f"🌐 {domain}"
+        f"{title}\n\n"
+        f"By: {uploader}\n"
+        f"Duration: {duration}\n"
+        f"Source: {domain}"
     )
 
-    # Send thumbnail preview if available
     thumb_path = None
     if thumbnail_url:
         try:
@@ -320,12 +335,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
         finally:
-            os.unlink(thumb_path)
+            try:
+                os.unlink(thumb_path)
+            except Exception:
+                pass
     else:
         await update.message.reply_text(
             caption,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -337,29 +356,30 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracker = context.user_data.get("tracker")
         if tracker:
             tracker.cancelled = True
-        await edit_callback_message(query, "❌ تم الإلغاء.")
+        await edit_callback_message(query, "Download cancelled.")
         return
 
     if user.id != ADMIN_ID:
         remaining = get_remaining(user.id)
         if remaining <= 0:
-            await edit_callback_message(query, "❌ انتهت حصتك اليومية. تواصل مع المالك.")
+            await edit_callback_message(query, "Daily limit reached. Contact the owner.")
             return
 
     url = context.user_data.get("current_url")
     if not url:
-        await edit_callback_message(query, "❌ الرابط غير صالح، أرسل رابطاً جديداً.")
+        await edit_callback_message(query, "Link expired. Please send a new link.")
         return
 
     quality_labels = {
-        "mp4_1080": ("1080p Full HD", "bestvideo[height<=1080]+bestaudio/best[height<=1080]", "mp4"),
-        "mp4_720": ("720p HD", "bestvideo[height<=720]+bestaudio/best[height<=720]", "mp4"),
-        "mp4_480": ("480p SD", "bestvideo[height<=480]+bestaudio/best[height<=480]", "mp4"),
-        "mp3": ("MP3 320kbps", "bestaudio/best", None),
+        "mp4_1080": ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best", "mp4"),
+        "mp4_720": ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]/best", "mp4"),
+        "mp4_480": ("480p", "bestvideo[height<=480]+bestaudio/best[height<=480]/best", "mp4"),
+        "mp4_best": ("Best", "best", "mp4"),
+        "mp3": ("MP3", "bestaudio/best", None),
     }
 
     if choice not in quality_labels:
-        await edit_callback_message(query, "❌ اختيار غير صالح.")
+        await edit_callback_message(query, "Invalid choice.")
         return
 
     label, fmt, merge_fmt = quality_labels[choice]
@@ -378,9 +398,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await edit_callback_message(
         query,
-        f"⏳ بدء التحميل بصيغة {label}...",
+        f"Starting download: {label}...",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
+            InlineKeyboardButton("Cancel", callback_data="cancel")
         ]]),
     )
 
@@ -401,77 +421,99 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         while not future.done():
             if tracker.cancelled:
-                await status_msg.edit_text("❌ تم إلغاء التحميل.")
+                await edit_callback_message(status_msg if hasattr(status_msg, 'edit_text') else query.message, "Download cancelled.")
                 return
 
             await asyncio.sleep(1)
             pct, speed, eta = tracker.get_progress()
             bar = progress_bar(pct)
-            parts = [f"📥 {label}", f"`{bar}`"]
+            parts = [f"Downloading: {label}", f"`{bar}`"]
             if speed:
-                parts.append(f"⚡ {speed}")
+                parts.append(f"Speed: {speed}")
             if eta:
-                parts.append(f"⏱ {eta}")
+                parts.append(f"ETA: {eta}")
             try:
-                await status_msg.edit_text(
-                    "\n".join(parts),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
-                    ]]),
-                    parse_mode="Markdown",
-                )
+                if hasattr(status_msg, 'edit_text'):
+                    await status_msg.edit_text(
+                        "\n".join(parts),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("Cancel", callback_data="cancel")
+                        ]]),
+                        parse_mode="Markdown",
+                    )
             except Exception:
                 pass
 
         info, filename = await future
 
-        if not os.path.exists(filename):
-            await status_msg.edit_text("❌ فشل التحميل: الملف لم يتم إنشاؤه.")
+        if not filename or not os.path.exists(filename):
+            try:
+                if status_msg and hasattr(status_msg, 'edit_text'):
+                    await status_msg.edit_text("Download failed: file was not created.")
+            except Exception:
+                pass
             return
 
         file_size = os.path.getsize(filename)
         if file_size > MAX_FILE_SIZE:
             os.remove(filename)
             filename = None
-            await status_msg.edit_text(
-                f"❌ الملف كبير جداً ({fmt_size(file_size)}).\n"
-                f"الحد الأقصى: {MAX_FILE_SIZE // 1024 // 1024}MB.\n"
-                "جرب جودة أقل أو صيغة MP3."
-            )
+            try:
+                if status_msg and hasattr(status_msg, 'edit_text'):
+                    await status_msg.edit_text(
+                        f"File too large ({fmt_size(file_size)}).\n"
+                        f"Max allowed: {MAX_FILE_SIZE // 1024 // 1024}MB.\n"
+                        "Try a lower quality or MP3."
+                    )
+            except Exception:
+                pass
             return
 
-        await status_msg.edit_text("🚀 جاري رفع الملف إلى تيليجرام...")
+        try:
+            if status_msg and hasattr(status_msg, 'edit_text'):
+                await status_msg.edit_text("Uploading to Telegram...")
+        except Exception:
+            pass
 
         caption = (
-            f"✅ تم التحميل بنجاح!\n"
-            f"🎬 {info.get('title', '')}\n"
-            f"⚙️ {label} | {fmt_size(file_size)}"
+            f"Downloaded!\n"
+            f"{info.get('title', '')}\n"
+            f"{label} | {fmt_size(file_size)}"
         )
 
         with open(filename, "rb") as f:
             if is_audio:
                 await query.message.reply_audio(audio=f, caption=caption)
             else:
-                await query.message.reply_video(video=f, caption=caption)
+                if file_size > 50 * 1024 * 1024:
+                    await query.message.reply_document(document=f, caption=caption)
+                else:
+                    await query.message.reply_video(video=f, caption=caption)
 
         if user.id != ADMIN_ID:
             inc_downloads(user.id)
             remaining = get_remaining(user.id)
             await query.message.reply_text(
-                f"⚡ تبقى لك اليوم: {remaining} تحميلات\n"
-                "💎 للاشتراك غير المحدود تواصل مع المالك."
+                f"Downloads left today: {remaining}\n"
+                "Contact the owner for unlimited access."
             )
 
     except asyncio.CancelledError:
-        await status_msg.edit_text("❌ تم إلغاء التحميل.")
+        try:
+            if status_msg and hasattr(status_msg, 'edit_text'):
+                await status_msg.edit_text("Download cancelled.")
+        except Exception:
+            pass
     except Exception:
         logger.exception("Download failed")
-        await status_msg.edit_text(
-            "❌ فشل التحميل. الأسباب المحتملة:\n"
-            "• الرابط خاص أو محذوف\n"
-            "• الموقع يتطلب تسجيل دخول\n"
-            "• الفيديو طويل جداً (جرب MP3 أو جودة أقل)"
-        )
+        try:
+            if status_msg and hasattr(status_msg, 'edit_text'):
+                await status_msg.edit_text(
+                    "Download failed.\n"
+                    "The link may be private, deleted, or the video is too long."
+                )
+        except Exception:
+            pass
     finally:
         if filename and os.path.exists(filename):
             try:
@@ -480,14 +522,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         context.user_data.pop("tracker", None)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     if not TOKEN or ADMIN_ID == 0:
-        logger.error("تأكد من وجود BOT_TOKEN و ADMIN_ID في ملف .env")
+        logger.error("Missing BOT_TOKEN or ADMIN_ID in environment variables")
         sys.exit(1)
+
+    logger.info("Bot starting... Token: %s... Admin: %s", TOKEN[:10], ADMIN_ID)
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -500,8 +541,9 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    logger.info("✅ البوت يعمل...")
-    app.run_polling()
+    logger.info("Bot is running!")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
